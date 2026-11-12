@@ -1,7 +1,7 @@
 {
-  "name": "decky-gsr",
+  "name": "decky-streamer",
   "version": "0.0.1",
-  "description": "Decky pluging to allow the Deck to stream via GPU Screen Recorder.",
+  "description": "Decky pluging to allow the Deck to easily stream while in Game Mode.",
   "type": "module",
   "scripts": {
     "build": "rollup -c",
@@ -10,7 +10,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/famellad/decky-gsr.git"
+    "url": "git+https://github.com/famellad/decky-streamer.git"
   },
   "keywords": [
     "decky",
@@ -19,12 +19,12 @@
     "steam-deck",
     "deck"
   ],
-  "author": "You <you@you.tld>",
+  "author": "Felipe Mellado <f.melladou@proton.me>",
   "license": "BSD-3-Clause",
   "bugs": {
-    "url": "https://github.com/famellad/decky-gsr/issues"
+    "url": "https://github.com/famellad/decky-streamer/issues"
   },
-  "homepage": "https://github.com/famellad/decky-gsr",
+  "homepage": "https://github.com/famellad/decky-streamer",
   "devDependencies": {
     "@decky/rollup": "^1.0.2",
     "@decky/ui": "^4.16.5",

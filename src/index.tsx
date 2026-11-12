@@ -13,6 +13,7 @@ type StartResult = { ok: boolean; pid?: number; error?: string };
 type StatusResult = { running: boolean; pid: number | null };
 
 const isGsrInstalled = callable<[], boolean>("is_gsr_installed");
+const getCaptureMode = callable<[], { mode: string; display: string | null }>("get_capture_mode");
 const streamStatus = callable<[], StatusResult>("stream_status");
 const startStream = callable<[service: string], StartResult>("start_stream");
 const stopStream = callable<[], { ok: boolean; error?: string }>("stop_stream");
@@ -28,6 +29,7 @@ const SERVICE_OPTIONS = [
 
 function Content() {
   const [installed, setInstalled] = useState<boolean | null>(null);
+  const [captureMode, setCaptureMode] = useState<string>("gsr");
   const [service, setService] = useState("twitch");
   const [running, setRunning] = useState(false);
   const [pid, setPid] = useState<number | null>(null);
@@ -36,12 +38,13 @@ function Content() {
 
   useEffect(() => {
     isGsrInstalled().then(setInstalled).catch(() => setInstalled(false));
+    getCaptureMode().then((m) => setCaptureMode(m.mode)).catch(() => {});
     getSelectedService()
       .then((s) => {
-        console.log("[Decky GSR] loaded:", s);
+        console.log("[Decky Streamer] loaded:", s);
         setService(s);
       })
-      .catch((e) => console.error("[Decky GSR] load failed:", e));
+      .catch((e) => console.error("[Decky Streamer] load failed:", e));
     streamStatus()
       .then((s) => {
         setRunning(s.running);
@@ -51,13 +54,13 @@ function Content() {
   }, []);
 
   const onServiceChange = (opt: any) => {
-    console.log("[Decky GSR] dropdown onChange:", opt);
+    console.log("[Decky Streamer] dropdown onChange:", opt);
     const value = typeof opt === "string" ? opt : opt?.data;
     if (typeof value === "string") {
       setService(value);
       setSelectedService(value)
-        .then(() => console.log("[Decky GSR] saved:", value))
-        .catch((e) => console.error("[Decky GSR] save failed:", e));
+        .then(() => console.log("[Decky Streamer] saved:", value))
+        .catch((e) => console.error("[Decky Streamer] save failed:", e));
     }
   };
 
@@ -95,69 +98,52 @@ function Content() {
     }
   };
 
-  const installMessage =
-    installed === null
-      ? "Checking for GPU Screen Recorder..."
-      : installed
-      ? "GPU Screen Recorder installed correctly."
-      : "GPU Screen Recorder not installed, visit flathub.org in desktop mode.";
+  const modeMessage =
+    captureMode === "gsr"
+      ? "External display detected: using GPU Screen Recorder."
+      : installed === false
+      ? "GPU Screen Recorder not installed: using the PipeWire fallback, performance may be reduced. For an external display, install it from flathub.org in desktop mode."
+      : "Handheld mode: using the PipeWire fallback, performance may be reduced.";
 
   return (
-    <>
-      <PanelSection title="Status">
+    <PanelSection title="Stream">
+      <PanelSectionRow>
+        <DropdownItem
+          label="Service"
+          rgOptions={SERVICE_OPTIONS}
+          selectedOption={service}
+          disabled={running || busy}
+          onChange={onServiceChange}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" disabled={running || busy} onClick={onStart}>
+          Start stream
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" disabled={!running || busy} onClick={onStop}>
+          Stop stream
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <div>{running ? `Streaming (pid ${pid})` : "Not streaming"}</div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <div>{modeMessage}</div>
+      </PanelSectionRow>
+      {error && (
         <PanelSectionRow>
-          <div>{installMessage}</div>
+          <div>{error}</div>
         </PanelSectionRow>
-      </PanelSection>
-
-      {installed && (
-        <PanelSection title="Stream">
-          <PanelSectionRow>
-            <DropdownItem
-              label="Service"
-              rgOptions={SERVICE_OPTIONS}
-              selectedOption={service}
-              disabled={running || busy}
-              onChange={onServiceChange}
-            />
-          </PanelSectionRow>
-          <PanelSectionRow>
-            <ButtonItem
-              layout="below"
-              disabled={running || busy}
-              onClick={onStart}
-            >
-              Start stream
-            </ButtonItem>
-          </PanelSectionRow>
-          <PanelSectionRow>
-            <ButtonItem
-              layout="below"
-              disabled={!running || busy}
-              onClick={onStop}
-            >
-              Stop stream
-            </ButtonItem>
-          </PanelSectionRow>
-          <PanelSectionRow>
-            <div>
-              {running ? `Streaming (pid ${pid})` : "Not streaming"}
-            </div>
-          </PanelSectionRow>
-          {error && (
-            <PanelSectionRow>
-              <div>{error}</div>
-            </PanelSectionRow>
-          )}
-        </PanelSection>
       )}
-    </>
+    </PanelSection>
   );
 }
 
 export default definePlugin(() => ({
-  name: "Decky GSR",
-  titleView: <div className={staticClasses.Title}>Decky GSR</div>,
+  name: "Decky Streamer",
+  titleView: <div className={staticClasses.Title}>Decky Streamer</div>,
   content: <Content />,
   icon: <FaVideo />,
   onDismount() {},
