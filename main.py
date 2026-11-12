@@ -11,11 +11,6 @@ GSR_APP_ID = "com.dec05eba.gpu_screen_recorder"
 GSR_PATTERN = "gpu-screen-recorder -w"   # was "... -w screen", and it would have been the end of it and super easy and not a hassle at all, now we have to pass a connector name because the Steam Deck AMD drivers are fucking stupid
 SERVICES = ("twitch", "youtube", "custom")
 
-GST_VIDEO_ENCODE = [
-    "vapostproc", "!",
-    "vah264enc", "bitrate=4500", "key-int-max=60", "!",
-    "h264parse",
-]
 GST_AUDIO_SOURCE = "@DEFAULT_MONITOR@"
 
 DEFAULT_CONFIG = {
@@ -24,6 +19,15 @@ DEFAULT_CONFIG = {
     "custom":  {"ingest": "",                                  "key": ""},
 }
 
+QUALITY_PRESETS = {   # kbit/s
+    "potato": 1000,
+    "low": 2200,
+    "balanced": 4500,
+    "high": 6500,
+    "very_high": 8000,
+}
+DEFAULT_QUALITY = "balanced"
+
 # ---------- config ----------
 
 def _config_path() -> str:
@@ -31,6 +35,21 @@ def _config_path() -> str:
 
 def _state_path() -> str:
     return os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "state.json")
+
+def _load_state() -> dict:
+    try:
+        with open(_state_path()) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _save_state(**updates):
+    state = _load_state()          # keep whatever else is already saved
+    state.update(updates)
+    os.makedirs(decky.DECKY_PLUGIN_SETTINGS_DIR, exist_ok=True)
+    with open(_state_path(), "w") as f:
+        json.dump(state, f)
 
 def _write_default_config():
     os.makedirs(decky.DECKY_PLUGIN_SETTINGS_DIR, exist_ok=True)
@@ -62,25 +81,34 @@ def load_config() -> dict:
         decky.logger.error(f"Could not read config, using defaults: {e}")
     return cfg
 # ---------- Command builders ----------
-def _build_gst_cmd(url: str) -> list:
+def _gst_video_encode(bitrate: int, framerate: int) -> list:
+    return [
+        "vapostproc", "!",
+        "vah264enc", f"bitrate={bitrate}", f"key-int-max={framerate}", "!",
+        "h264parse",
+    ]
+
+def _build_gst_cmd(url: str, bitrate: int, framerate: int) -> list:
     return [
         "gst-launch-1.0", "-e",
         "flvmux", "name=mux", "streamable=true", "!",
         "rtmp2sink", f"location={url}",
-        "pipewiresrc", "target-object=gamescope", "do-timestamp=true", "keepalive-time=33", "!", "queue", "!",
-        *GST_VIDEO_ENCODE, "!", "queue", "!", "mux.",
+        "pipewiresrc", "target-object=gamescope", "do-timestamp=true", f"keepalive-time={round(1000 / framerate)}", "!", "queue", "!",
+        *_gst_video_encode(bitrate, framerate), "!", "queue", "!", "mux.",
         "pulsesrc", f"device={GST_AUDIO_SOURCE}", "!", "queue", "!",
         "audioconvert", "!", "audioresample", "!",
         "avenc_aac", "bitrate=128000", "!", "aacparse", "!", "queue", "!", "mux.",
     ]
 
-def _build_gsr_cmd(url: str, ext: str) -> list:
+def _build_gsr_cmd(url: str, bitrate: int, framerate: int, ext: str) -> list:
     return [
         "flatpak", "run", "--command=gpu-screen-recorder", GSR_APP_ID,
         "-w", ext,
-        "-f", "30",
+        "-f", str(framerate),
         "-a", "default_output",
         "-c", "flv",
+        "-bm", "cbr",
+        "-q", str(bitrate),
         "-o", url,
     ]
 # ---------- process helpers ----------
@@ -181,25 +209,20 @@ class Plugin:
         return {"mode": mode, "display": ext}
 
     async def get_selected_service(self) -> str:
-        try:
-            with open(_state_path()) as f:
-                s = json.load(f).get("service")
-            decky.logger.info(f"get_selected_service -> {s}")
-            return s if s in SERVICES else "twitch"
-        except Exception as e:
-            decky.logger.error(f"get_selected_service failed: {e}")
-            return "twitch"
+        s = _load_state().get("service")
+        return s if s in SERVICES else "twitch"
 
     async def set_selected_service(self, service: str) -> None:
-        decky.logger.info(f"set_selected_service({service})")
-        if service not in SERVICES:
-            return
-        try:
-            os.makedirs(decky.DECKY_PLUGIN_SETTINGS_DIR, exist_ok=True)
-            with open(_state_path(), "w") as f:
-                json.dump({"service": service}, f)
-        except Exception as e:
-            decky.logger.error(f"set_selected_service failed: {e}")
+        if service in SERVICES:
+            _save_state(service=service)
+
+    async def get_selected_quality(self) -> str:
+        q = _load_state().get("quality")
+        return q if q in QUALITY_PRESETS else DEFAULT_QUALITY
+
+    async def set_selected_quality(self, quality: str) -> None:
+        if quality in QUALITY_PRESETS:
+            _save_state(quality=quality)
 
 
     async def stream_status(self) -> dict:
@@ -224,12 +247,21 @@ class Plugin:
         ext = find_external_display()
         use_gsr = bool(ext) and await self.is_gsr_installed()
 
-        if use_gsr:
-            cmd = _build_gsr_cmd(url, ext)
-            log_name = "gsr.log"
-        else:
-            cmd = _build_gst_cmd(url)
-            log_name = "gst.log"
+        quality = _load_state().get("quality")
+        bitrate = QUALITY_PRESETS.get(quality, QUALITY_PRESETS[DEFAULT_QUALITY])
+
+        framerate = 30
+
+        try:
+            if use_gsr:
+                cmd = _build_gsr_cmd(url, bitrate, framerate, ext)
+                log_name = "gsr.log"
+            else:
+                cmd = _build_gst_cmd(url, bitrate, framerate)
+                log_name = "gst.log"
+        except Exception as e:
+            decky.logger.exception("Failed to build stream command")
+            return {"ok": False, "error": f"Internal error building command: {e}"}
 
         env, user_kwargs = _user_ctx()
         log_path = os.path.join(decky.DECKY_PLUGIN_LOG_DIR, log_name)

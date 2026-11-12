@@ -3,6 +3,7 @@ import {
   DropdownItem,
   PanelSection,
   PanelSectionRow,
+  SliderField,
   staticClasses,
 } from "@decky/ui";
 import { callable, definePlugin } from "@decky/api";
@@ -20,6 +21,9 @@ const stopStream = callable<[], { ok: boolean; error?: string }>("stop_stream");
 
 const getSelectedService = callable<[], string>("get_selected_service");
 const setSelectedService = callable<[service: string], void>("set_selected_service");
+const getSelectedQuality = callable<[], string>("get_selected_quality");
+const setSelectedQuality = callable<[quality: string], void>("set_selected_quality");
+
 
 const SERVICE_OPTIONS = [
   { data: "twitch", label: "Twitch" },
@@ -27,10 +31,21 @@ const SERVICE_OPTIONS = [
   { data: "custom", label: "Custom" },
 ];
 
+// The order here is the order on the slider. `mbps` is for display only;
+// the real bitrates live in QUALITY_PRESETS in main.py.
+const QUALITY_OPTIONS = [
+  { key: "potato", label: "Potato", mbps: "1" },
+  { key: "low", label: "Low", mbps: "2.2" },
+  { key: "balanced", label: "Balanced", mbps: "4.5" },
+  { key: "high", label: "High", mbps: "6.5" },
+  { key: "very_high", label: "Very High", mbps: "8" },
+];
+
 function Content() {
   const [installed, setInstalled] = useState<boolean | null>(null);
   const [captureMode, setCaptureMode] = useState<string>("gsr");
   const [service, setService] = useState("twitch");
+  const [quality, setQuality] = useState(2);
   const [running, setRunning] = useState(false);
   const [pid, setPid] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
@@ -45,6 +60,12 @@ function Content() {
         setService(s);
       })
       .catch((e) => console.error("[Decky Streamer] load failed:", e));
+    getSelectedQuality()
+      .then((k) => {
+        const i = QUALITY_OPTIONS.findIndex((q) => q.key === k);
+        if (i >= 0) setQuality(i);
+      })
+      .catch(() => {});
     streamStatus()
       .then((s) => {
         setRunning(s.running);
@@ -52,6 +73,26 @@ function Content() {
       })
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    // Don't poll while a start/stop is in progress, or it fights with onStart/onStop.
+    if (busy) return undefined;
+
+    const timer = setInterval(() => {
+      streamStatus()
+        .then((s) => {
+          if (running && !s.running) {
+            setError("Stream ended unexpectedly. Check the plugin's log folder.");
+          }
+          setRunning(s.running);
+          setPid(s.pid);
+        })
+        .catch(() => {});
+    }, 2000);
+
+    // Cleanup: runs when the panel closes or the values below change.
+    return () => clearInterval(timer);
+  }, [busy, running]);
 
   const onServiceChange = (opt: any) => {
     console.log("[Decky Streamer] dropdown onChange:", opt);
@@ -62,6 +103,11 @@ function Content() {
         .then(() => console.log("[Decky Streamer] saved:", value))
         .catch((e) => console.error("[Decky Streamer] save failed:", e));
     }
+  };
+
+  const onQualityChange = (index: number) => {
+    setQuality(index);
+    setSelectedQuality(QUALITY_OPTIONS[index].key).catch(() => {});
   };
 
   const onStart = async () => {
@@ -102,8 +148,8 @@ function Content() {
     captureMode === "gsr"
       ? "External display detected: using GPU Screen Recorder."
       : installed === false
-      ? "GPU Screen Recorder not installed: using the PipeWire fallback, performance may be reduced. For an external display, install it from flathub.org in desktop mode."
-      : "Handheld mode: using the PipeWire fallback, performance may be reduced.";
+      ? "GPU Screen Recorder not installed: using the PipeWire fallback, performance and quality may be minimally reduced. For an external display, install it from flathub.org in desktop mode."
+      : "Handheld mode: using the PipeWire fallback, performance and quality may be minimally reduced.";
 
   return (
     <PanelSection title="Stream">
@@ -114,6 +160,20 @@ function Content() {
           selectedOption={service}
           disabled={running || busy}
           onChange={onServiceChange}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <SliderField
+          label={`Quality: ${QUALITY_OPTIONS[quality].label} (${QUALITY_OPTIONS[quality].mbps} Mbps)`}
+          value={quality}
+          min={0}
+          max={QUALITY_OPTIONS.length - 1}
+          step={1}
+          notchCount={QUALITY_OPTIONS.length}
+          notchTicksVisible={true}
+          showValue={false}
+          disabled={running || busy}
+          onChange={onQualityChange}
         />
       </PanelSectionRow>
       <PanelSectionRow>
