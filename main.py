@@ -7,6 +7,7 @@ import signal
 import decky
 
 GSR_APP_ID = "com.dec05eba.gpu_screen_recorder"
+GSR_PATTERN = "gpu-screen-recorder -w screen"
 SERVICES = ("twitch", "youtube", "custom")
 
 DEFAULT_CONFIG = {
@@ -77,6 +78,21 @@ def _user_ctx():
         }
     return env, kwargs
 
+async def _exec(*cmd) -> int:
+    env, user_kwargs = _user_ctx()
+    p = await asyncio.create_subprocess_exec(
+        *cmd,
+        env=env,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        **user_kwargs,
+    )
+    await p.wait()
+    return p.returncode
+
+# Get the PID of the actual GSR process rather than the flatpak command that spanwed it
+async def _gsr_alive() -> bool:
+    return await _exec("pgrep", "-f", GSR_PATTERN) == 0
 
 class Plugin:
     proc = None  # asyncio subprocess of the running stream, if any
@@ -194,28 +210,32 @@ class Plugin:
 
     async def stop_stream(self) -> dict:
         proc = self.proc
-        if proc is None or proc.returncode is not None:
-            self.proc = None
-            return {"ok": True}
+        # 1. Graceful: SIGINT the real GSR process inside the sandbox,
+        #    and the flatpak wrapper too.
+        await _exec("pkill", "-INT", "-f", GSR_PATTERN)
+        if proc is not None and proc.returncode is None:
+            proc.send_signal(signal.SIGINT)
 
-        proc.send_signal(signal.SIGINT)  # Stops GSR cleanly and entirely
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            decky.logger.warning("GSR did not exit on SIGINT, forcing")
-            env, user_kwargs = _user_ctx()
-            k = await asyncio.create_subprocess_exec(
-                "flatpak", "kill", GSR_APP_ID, env=env,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-                **user_kwargs,
-            )
-            await k.wait()
-            if proc.returncode is None:
+        # 2. Wait up to ~8s for everything to actually exit.
+        for _ in range(40):
+            wrapper_gone = proc is None or proc.returncode is not None
+            if wrapper_gone and not await _gsr_alive():
+                break
+            await asyncio.sleep(0.2)
+        else:
+            # 3. Forceful fallback: kill the whole sandbox.
+            decky.logger.warning("GSR did not exit on SIGINT, using flatpak kill")
+            await _exec("flatpak", "kill", GSR_APP_ID)
+            await asyncio.sleep(1)
+            if proc is not None and proc.returncode is None:
                 proc.kill()
-                await proc.wait()
 
+        still_alive = await _gsr_alive()
         self.proc = None
+        if still_alive:
+            decky.logger.error("GSR still running after stop attempts")
+            return {"ok": False, "error": "Could not stop GSR. Check gsr.log."}
+
         decky.logger.info("Stream stopped")
         return {"ok": True}
 
