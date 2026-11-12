@@ -1,11 +1,86 @@
 import asyncio
+import json
 import os
+import pwd
+import signal
 
 import decky
 
 GSR_APP_ID = "com.dec05eba.gpu_screen_recorder"
+SERVICES = ("twitch", "youtube", "custom")
+
+DEFAULT_CONFIG = {
+    "twitch":  {"ingest": "rtmp://live.twitch.tv/app",        "key": ""},
+    "youtube": {"ingest": "rtmp://a.rtmp.youtube.com/live2",  "key": ""},
+    "custom":  {"ingest": "",                                  "key": ""},
+}
+
+
+# ---------- config ----------
+
+def _config_path() -> str:
+    return os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "config.json")
+
+def _write_default_config():
+    os.makedirs(decky.DECKY_PLUGIN_SETTINGS_DIR, exist_ok=True)
+    path = _config_path()
+    with open(path, "w") as f:
+        json.dump(DEFAULT_CONFIG, f, indent=2)
+    # Contains stream keys: owned by the user, not world-readable.
+    pw = pwd.getpwnam(decky.DECKY_USER)
+    if os.geteuid() == 0:
+        pw = pwd.getpwnam(decky.DECKY_USER)
+        os.chown(path, pw.pw_uid, pw.pw_gid)
+    os.chmod(path, 0o600)
+
+def load_config() -> dict:
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
+    path = _config_path()
+    if not os.path.exists(path):
+        _write_default_config()
+        return cfg
+    try:
+        with open(path) as f:
+            user_cfg = json.load(f)
+        for service in SERVICES:
+            section = user_cfg.get(service)
+            if isinstance(section, dict):
+                for k in ("ingest", "key"):
+                    if isinstance(section.get(k), str):
+                        cfg[service][k] = section[k]
+    except Exception as e:
+        decky.logger.error(f"Could not read config, using defaults: {e}")
+    return cfg
+
+def _state_path() -> str:
+    return os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "state.json")
+
+# ---------- process helpers ----------
+
+def _user_ctx():
+    """Env (and, only if we're root, credentials) for running as the real user."""
+    pw = pwd.getpwnam(decky.DECKY_USER)
+    runtime_dir = f"/run/user/{pw.pw_uid}"
+    env = {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": pw.pw_dir,
+        "XDG_RUNTIME_DIR": runtime_dir,
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime_dir}/bus",
+        "WAYLAND_DISPLAY": "gamescope-0",
+    }
+    kwargs = {}
+    if os.geteuid() == 0:  # only possible if plugin.json has the "root" flag
+        kwargs = {
+            "user": pw.pw_uid,
+            "group": pw.pw_gid,
+            "extra_groups": os.getgrouplist(pw.pw_name, pw.pw_gid),
+        }
+    return env, kwargs
+
 
 class Plugin:
+    proc = None  # asyncio subprocess of the running stream, if any
+
     async def is_gsr_installed(self) -> bool:
         """True if the GPU Screen Recorder Flatpak is installed (user or system)."""
         # Decky's bundled Python can leak LD_LIBRARY_PATH etc. into child
@@ -40,11 +115,116 @@ class Plugin:
             decky.logger.info(f"flatpak info said: {stderr.decode().strip()}")
         return installed
 
+    async def get_selected_service(self) -> str:
+        try:
+            with open(_state_path()) as f:
+                s = json.load(f).get("service")
+            decky.logger.info(f"get_selected_service -> {s}")
+            return s if s in SERVICES else "twitch"
+        except Exception as e:
+            decky.logger.error(f"get_selected_service failed: {e}")
+            return "twitch"
+
+    async def set_selected_service(self, service: str) -> None:
+        decky.logger.info(f"set_selected_service({service})")
+        if service not in SERVICES:
+            return
+        try:
+            os.makedirs(decky.DECKY_PLUGIN_SETTINGS_DIR, exist_ok=True)
+            with open(_state_path(), "w") as f:
+                json.dump({"service": service}, f)
+        except Exception as e:
+            decky.logger.error(f"set_selected_service failed: {e}")
+
+
+    async def stream_status(self) -> dict:
+        running = self.proc is not None and self.proc.returncode is None
+        return {"running": running, "pid": self.proc.pid if running else None}
+
+    async def start_stream(self, service: str) -> dict:
+        if self.proc is not None and self.proc.returncode is None:
+            return {"ok": False, "error": "A stream is already running."}
+        if service not in SERVICES:
+            return {"ok": False, "error": f"Unknown service: {service}"}
+
+        section = load_config()[service]
+        if not section["ingest"] or not section["key"]:
+            return {
+                "ok": False,
+                "error": f"Set the {service} ingest address and stream key in "
+                         f"{_config_path()}",
+            }
+        url = section["ingest"].rstrip("/") + "/" + section["key"]
+
+        cmd = [
+            "flatpak", "run", "--command=gpu-screen-recorder", GSR_APP_ID,
+            "-w", "screen",
+            "-f", "30",
+            "-a", "default_output",
+            "-c", "flv",
+            "-o", url,
+        ]
+
+        env, user_kwargs = _user_ctx()
+        log_path = os.path.join(decky.DECKY_PLUGIN_LOG_DIR, "gsr.log")
+        try:
+            with open(log_path, "ab") as log:
+                self.proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    env=env,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=log,
+                    start_new_session=True,
+                    **user_kwargs,
+                )
+        except Exception as e:
+            decky.logger.error(f"Failed to launch GSR: {e}")
+            return {"ok": False, "error": f"Failed to launch: {e}"}
+
+        # Catch immediate failures (bad args, capture permission, etc.)
+        await asyncio.sleep(2)
+        if self.proc.returncode is not None:
+            code = self.proc.returncode
+            self.proc = None
+            return {"ok": False, "error": f"GSR exited immediately (code {code}). See gsr.log."}
+
+        decky.logger.info(f"Stream started ({service}), pid {self.proc.pid}")
+        return {"ok": True, "pid": self.proc.pid}
+
+    async def stop_stream(self) -> dict:
+        proc = self.proc
+        if proc is None or proc.returncode is not None:
+            self.proc = None
+            return {"ok": True}
+
+        proc.send_signal(signal.SIGINT)  # Stops GSR cleanly and entirely
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            decky.logger.warning("GSR did not exit on SIGINT, forcing")
+            env, user_kwargs = _user_ctx()
+            k = await asyncio.create_subprocess_exec(
+                "flatpak", "kill", GSR_APP_ID, env=env,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                **user_kwargs,
+            )
+            await k.wait()
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+
+        self.proc = None
+        decky.logger.info("Stream stopped")
+        return {"ok": True}
+
     async def _main(self):
         decky.logger.info("Decky GSR loaded")
 
     async def _unload(self):
-        decky.logger.info("Decky GSR unloading")
+        # Don't leave a stream running if the plugin gets reloaded/unloaded.
+        await self.stop_stream()
 
     async def _uninstall(self):
-        decky.logger.info("Decky GSR uninstalled")
+        pass
