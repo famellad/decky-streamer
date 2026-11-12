@@ -15,7 +15,7 @@ type StatusResult = { running: boolean; pid: number | null };
 const isGsrInstalled = callable<[], boolean>("is_gsr_installed");
 const streamStatus = callable<[], StatusResult>("stream_status");
 const startStream = callable<[service: string], StartResult>("start_stream");
-const stopStream = callable<[], { ok: boolean }>("stop_stream");
+const stopStream = callable<[], { ok: boolean; error?: string }>("stop_stream");
 
 const getSelectedService = callable<[], string>("get_selected_service");
 const setSelectedService = callable<[service: string], void>("set_selected_service");
@@ -81,10 +81,15 @@ function Content() {
 
   const onStop = async () => {
     setBusy(true);
+    setError(null);
     try {
-      await stopStream();
-      setRunning(false);
-      setPid(null);
+      const r = await stopStream();
+      if (r.ok) {
+        setRunning(false);
+        setPid(null);
+      } else {
+        setError(r.error ?? "Could not stop stream");
+      }
     } finally {
       setBusy(false);
     }
