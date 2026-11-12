@@ -1,7 +1,7 @@
 TODO readme
 
 # AI Disclaimer
-you are free to send a hitman to my place to shoot me in the back of the head
+you are free to send a hitman to my place to shoot me in the back of the head I don't speak Typescript sue me
 
 # Installation
 dev mode in decky loader and the git url
