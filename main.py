@@ -3,12 +3,20 @@ import json
 import os
 import pwd
 import signal
+import glob
 
 import decky
 
 GSR_APP_ID = "com.dec05eba.gpu_screen_recorder"
-GSR_PATTERN = "gpu-screen-recorder -w screen"
+GSR_PATTERN = "gpu-screen-recorder -w"   # was "... -w screen", and it would have been the end of it and super easy and not a hassle at all, now we have to pass a connector name because the Steam Deck AMD drivers are fucking stupid
 SERVICES = ("twitch", "youtube", "custom")
+
+GST_VIDEO_ENCODE = [
+    "vapostproc", "!",
+    "vah264enc", "bitrate=4500", "key-int-max=60", "!",
+    "h264parse",
+]
+GST_AUDIO_SOURCE = "@DEFAULT_MONITOR@"
 
 DEFAULT_CONFIG = {
     "twitch":  {"ingest": "rtmp://live.twitch.tv/app",        "key": ""},
@@ -16,11 +24,13 @@ DEFAULT_CONFIG = {
     "custom":  {"ingest": "",                                  "key": ""},
 }
 
-
 # ---------- config ----------
 
 def _config_path() -> str:
     return os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "config.json")
+
+def _state_path() -> str:
+    return os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "state.json")
 
 def _write_default_config():
     os.makedirs(decky.DECKY_PLUGIN_SETTINGS_DIR, exist_ok=True)
@@ -28,7 +38,6 @@ def _write_default_config():
     with open(path, "w") as f:
         json.dump(DEFAULT_CONFIG, f, indent=2)
     # Contains stream keys: owned by the user, not world-readable.
-    pw = pwd.getpwnam(decky.DECKY_USER)
     if os.geteuid() == 0:
         pw = pwd.getpwnam(decky.DECKY_USER)
         os.chown(path, pw.pw_uid, pw.pw_gid)
@@ -52,10 +61,28 @@ def load_config() -> dict:
     except Exception as e:
         decky.logger.error(f"Could not read config, using defaults: {e}")
     return cfg
+# ---------- Command builders ----------
+def _build_gst_cmd(url: str) -> list:
+    return [
+        "gst-launch-1.0", "-e",
+        "flvmux", "name=mux", "streamable=true", "!",
+        "rtmp2sink", f"location={url}",
+        "pipewiresrc", "target-object=gamescope", "do-timestamp=true", "keepalive-time=33", "!", "queue", "!",
+        *GST_VIDEO_ENCODE, "!", "queue", "!", "mux.",
+        "pulsesrc", f"device={GST_AUDIO_SOURCE}", "!", "queue", "!",
+        "audioconvert", "!", "audioresample", "!",
+        "avenc_aac", "bitrate=128000", "!", "aacparse", "!", "queue", "!", "mux.",
+    ]
 
-def _state_path() -> str:
-    return os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "state.json")
-
+def _build_gsr_cmd(url: str, ext: str) -> list:
+    return [
+        "flatpak", "run", "--command=gpu-screen-recorder", GSR_APP_ID,
+        "-w", ext,
+        "-f", "30",
+        "-a", "default_output",
+        "-c", "flv",
+        "-o", url,
+    ]
 # ---------- process helpers ----------
 
 def _user_ctx():
@@ -94,8 +121,24 @@ async def _exec(*cmd) -> int:
 async def _gsr_alive() -> bool:
     return await _exec("pgrep", "-f", GSR_PATTERN) == 0
 
+def find_external_display():
+    """Return the name of a connected non-internal connector (e.g. 'DP-1'), or None."""
+    for status_file in sorted(glob.glob("/sys/class/drm/card*-*/status")):
+        connector = os.path.basename(os.path.dirname(status_file))  # e.g. card1-DP-1
+        name = connector.split("-", 1)[1]                           # e.g. DP-1
+        if name.startswith(("eDP", "LVDS", "DSI")):
+            continue
+        try:
+            with open(status_file) as f:
+                if f.read().strip() == "connected":
+                    return name
+        except OSError:
+            continue
+    return None
+
 class Plugin:
     proc = None  # asyncio subprocess of the running stream, if any
+    mode = None  # Gotta choose between GSR and GStreamer
 
     async def is_gsr_installed(self) -> bool:
         """True if the GPU Screen Recorder Flatpak is installed (user or system)."""
@@ -130,6 +173,12 @@ class Plugin:
         if not installed:
             decky.logger.info(f"flatpak info said: {stderr.decode().strip()}")
         return installed
+
+    async def get_capture_mode(self) -> dict:
+        ext = find_external_display()
+        gsr_ok = await self.is_gsr_installed()
+        mode = "gsr" if (ext and gsr_ok) else "gstreamer"
+        return {"mode": mode, "display": ext}
 
     async def get_selected_service(self) -> str:
         try:
@@ -167,22 +216,23 @@ class Plugin:
         if not section["ingest"] or not section["key"]:
             return {
                 "ok": False,
-                "error": f"Set the {service} ingest address and stream key in "
+                "error": f"Set the {service} stream key in "
                          f"{_config_path()}",
             }
         url = section["ingest"].rstrip("/") + "/" + section["key"]
 
-        cmd = [
-            "flatpak", "run", "--command=gpu-screen-recorder", GSR_APP_ID,
-            "-w", "screen",
-            "-f", "30",
-            "-a", "default_output",
-            "-c", "flv",
-            "-o", url,
-        ]
+        ext = find_external_display()
+        use_gsr = bool(ext) and await self.is_gsr_installed()
+
+        if use_gsr:
+            cmd = _build_gsr_cmd(url, ext)
+            log_name = "gsr.log"
+        else:
+            cmd = _build_gst_cmd(url)
+            log_name = "gst.log"
 
         env, user_kwargs = _user_ctx()
-        log_path = os.path.join(decky.DECKY_PLUGIN_LOG_DIR, "gsr.log")
+        log_path = os.path.join(decky.DECKY_PLUGIN_LOG_DIR, log_name)
         try:
             with open(log_path, "ab") as log:
                 self.proc = await asyncio.create_subprocess_exec(
@@ -195,43 +245,60 @@ class Plugin:
                     **user_kwargs,
                 )
         except Exception as e:
-            decky.logger.error(f"Failed to launch GSR: {e}")
+            decky.logger.error(f"Failed to launch stream: {e}")
             return {"ok": False, "error": f"Failed to launch: {e}"}
 
-        # Catch immediate failures (bad args, capture permission, etc.)
+        self.mode = "gsr" if use_gsr else "gstreamer"
+
+        # Catch immediate failures (bad args, missing plugin, etc.)
         await asyncio.sleep(2)
         if self.proc.returncode is not None:
             code = self.proc.returncode
             self.proc = None
-            return {"ok": False, "error": f"GSR exited immediately (code {code}). See gsr.log."}
+            self.mode = None
+            return {"ok": False, "error": f"Stream process exited immediately (code {code}). See {log_name}."}
 
-        decky.logger.info(f"Stream started ({service}), pid {self.proc.pid}")
+        decky.logger.info(f"Stream started ({service}, {self.mode}), pid {self.proc.pid}")
         return {"ok": True, "pid": self.proc.pid}
 
     async def stop_stream(self) -> dict:
         proc = self.proc
-        # 1. Graceful: SIGINT the real GSR process inside the sandbox,
-        #    and the flatpak wrapper too.
+        if proc is None:
+            return {"ok": True}  # nothing of ours is running
+
+        if self.mode == "gstreamer":
+            if proc.returncode is None:
+                proc.send_signal(signal.SIGINT)  # with -e this triggers a clean EOS shutdown
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=8)
+                except asyncio.TimeoutError:
+                    decky.logger.warning("gst-launch did not exit on SIGINT, killing")
+                    proc.kill()
+                    await proc.wait()
+            self.proc = None
+            self.mode = None
+            decky.logger.info("Stream stopped")
+            return {"ok": True}
+
+        # ---- GSR path (unchanged from before) ----
         await _exec("pkill", "-INT", "-f", GSR_PATTERN)
-        if proc is not None and proc.returncode is None:
+        if proc.returncode is None:
             proc.send_signal(signal.SIGINT)
 
-        # 2. Wait up to ~8s for everything to actually exit.
         for _ in range(40):
-            wrapper_gone = proc is None or proc.returncode is not None
-            if wrapper_gone and not await _gsr_alive():
+            if proc.returncode is not None and not await _gsr_alive():
                 break
             await asyncio.sleep(0.2)
         else:
-            # 3. Forceful fallback: kill the whole sandbox.
             decky.logger.warning("GSR did not exit on SIGINT, using flatpak kill")
             await _exec("flatpak", "kill", GSR_APP_ID)
             await asyncio.sleep(1)
-            if proc is not None and proc.returncode is None:
+            if proc.returncode is None:
                 proc.kill()
 
         still_alive = await _gsr_alive()
         self.proc = None
+        self.mode = None
         if still_alive:
             decky.logger.error("GSR still running after stop attempts")
             return {"ok": False, "error": "Could not stop GSR. Check gsr.log."}
@@ -240,7 +307,7 @@ class Plugin:
         return {"ok": True}
 
     async def _main(self):
-        decky.logger.info("Decky GSR loaded")
+        decky.logger.info("Decky Streamer loaded")
 
     async def _unload(self):
         # Don't leave a stream running if the plugin gets reloaded/unloaded.
