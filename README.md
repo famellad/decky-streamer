@@ -22,8 +22,8 @@ The bundled elements are tested against Steam OS >TODO I FORGOR TO CHECK THE VER
 
 ## Installation
 
-1. Enable **Dev mode** in Decky Loader (Plugin Manager).
-2. Hit **Install from GitHub** and paste:
+1. Enable **Dev mode** in Decky Loader.
+2. Hit **Install from URL** and paste:
    `https://github.com/famellad/decky-streamer/releases/download/0.1.1/decky-streamer-v0.1.1.zip`
 
 *(Or build a release zip yourself — see [Building](#building) — and install it with Decky's usual zip installer.)*
