@@ -14,6 +14,7 @@ type StartResult = { ok: boolean; pid?: number; error?: string };
 type StatusResult = { running: boolean; pid: number | null };
 
 const isGsrInstalled = callable<[], boolean>("is_gsr_installed");
+const checkGstreamer = callable<[], { ok: boolean; missing: string[]; note?: string }>("check_gstreamer");
 const getCaptureMode = callable<[], { mode: string; display: string | null }>("get_capture_mode");
 const streamStatus = callable<[], StatusResult>("stream_status");
 const startStream = callable<[service: string], StartResult>("start_stream");
@@ -43,6 +44,8 @@ const QUALITY_OPTIONS = [
 
 function Content() {
   const [installed, setInstalled] = useState<boolean | null>(null);
+  const [gstMissing, setGstMissing] = useState<string[]>([]);
+  const [gstNote, setGstNote] = useState("");
   const [captureMode, setCaptureMode] = useState<string>("gsr");
   const [service, setService] = useState("twitch");
   const [quality, setQuality] = useState(2);
@@ -53,19 +56,28 @@ function Content() {
 
   useEffect(() => {
     isGsrInstalled().then(setInstalled).catch(() => setInstalled(false));
-    getCaptureMode().then((m) => setCaptureMode(m.mode)).catch(() => {});
+
+    checkGstreamer()
+      .then((r) => {
+        setGstMissing(r.missing);
+        setGstNote(r.note ?? "");
+      })
+      .catch(() => {});    getCaptureMode().then((m) => setCaptureMode(m.mode)).catch(() => {});
+
     getSelectedService()
       .then((s) => {
         console.log("[Decky Streamer] loaded:", s);
         setService(s);
       })
       .catch((e) => console.error("[Decky Streamer] load failed:", e));
+
     getSelectedQuality()
       .then((k) => {
         const i = QUALITY_OPTIONS.findIndex((q) => q.key === k);
         if (i >= 0) setQuality(i);
       })
       .catch(() => {});
+
     streamStatus()
       .then((s) => {
         setRunning(s.running);
@@ -144,6 +156,9 @@ function Content() {
     }
   };
 
+  // Only a problem if we wanna use GStreamer
+  const gstBroken = captureMode === "gstreamer" && gstMissing.length > 0;
+
   const modeMessage =
     captureMode === "gsr"
       ? "External display detected: using GPU Screen Recorder."
@@ -177,7 +192,7 @@ function Content() {
         />
       </PanelSectionRow>
       <PanelSectionRow>
-        <ButtonItem layout="below" disabled={running || busy} onClick={onStart}>
+        <ButtonItem layout="below" disabled={running || busy || gstBroken} onClick={onStart}>
           Start stream
         </ButtonItem>
       </PanelSectionRow>
@@ -186,6 +201,14 @@ function Content() {
           Stop stream
         </ButtonItem>
       </PanelSectionRow>
+      {gstBroken && (
+        <PanelSectionRow>
+          <div>
+            Handheld streaming isn't available on this system. Missing GStreamer
+            components: {gstMissing.join(", ")}. {gstNote}
+          </div>
+        </PanelSectionRow>
+      )}
       <PanelSectionRow>
         <div>{running ? `Streaming (pid ${pid})` : "Not streaming"}</div>
       </PanelSectionRow>

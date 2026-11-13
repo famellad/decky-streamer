@@ -4,6 +4,8 @@ import os
 import pwd
 import signal
 import glob
+import shutil
+import re
 
 import decky
 
@@ -12,6 +14,14 @@ GSR_PATTERN = "gpu-screen-recorder -w"   # was "... -w screen", and it would hav
 SERVICES = ("twitch", "youtube", "custom")
 
 GST_AUDIO_SOURCE = "@DEFAULT_MONITOR@"
+
+# Every element the pipeline in _build_gst_cmd uses (queue is core, so it's not listed).
+GST_REQUIRED = (
+    "pipewiresrc", "pulsesrc",
+    "vapostproc", "vah264enc", "h264parse",
+    "audioconvert", "audioresample", "avenc_aac", "aacparse",
+    "flvmux", "rtmp2sink",
+)
 
 DEFAULT_CONFIG = {
     "twitch":  {"ingest": "rtmp://live.twitch.tv/app",        "key": ""},
@@ -133,8 +143,10 @@ def _user_ctx():
         }
     return env, kwargs
 
-async def _exec(*cmd) -> int:
+async def _exec(*cmd, extra_env=None) -> int:
     env, user_kwargs = _user_ctx()
+    if extra_env:
+        env.update(extra_env)
     p = await asyncio.create_subprocess_exec(
         *cmd,
         env=env,
@@ -144,6 +156,87 @@ async def _exec(*cmd) -> int:
     )
     await p.wait()
     return p.returncode
+
+
+async def _capture(*cmd) -> str:
+    env, user_kwargs = _user_ctx()
+    p = await asyncio.create_subprocess_exec(
+        *cmd,
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        **user_kwargs,
+    )
+    out, _ = await p.communicate()
+    return out.decode(errors="replace")
+
+
+async def _probe_elements(extra_env=None) -> list:
+    """Names from GST_REQUIRED that gst-inspect cannot find."""
+    # First check alone: with a fresh registry it scans every plugin once,
+    # and the parallel checks after it reuse the result.
+    first = await _exec("gst-inspect-1.0", "--exists", GST_REQUIRED[0], extra_env=extra_env)
+    rest = await asyncio.gather(
+        *(_exec("gst-inspect-1.0", "--exists", e, extra_env=extra_env)
+          for e in GST_REQUIRED[1:])
+    )
+    return [e for e, rc in zip(GST_REQUIRED, [first, *rest]) if rc != 0]
+
+
+async def _bundle_key():
+    """Compatibility key like '1.28-ffmpeg62', or None if it can't be worked out."""
+    out = await _capture("gst-inspect-1.0", "--version")
+    m = re.search(r"GStreamer (\d+\.\d+)", out)
+    if not m:
+        return None
+    av = None
+    for d in ("/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu"):
+        for p in sorted(glob.glob(os.path.join(d, "libavcodec.so.*"))):
+            mm = re.search(r"libavcodec\.so\.(\d+)", os.path.basename(p))
+            if mm:
+                av = mm.group(1)
+                break
+        if av:
+            break
+    if av is None:
+        return None
+    return f"{m.group(1)}-ffmpeg{av}"
+
+
+async def _resolve_gst():
+    """Decide how GStreamer can be used. Returns (missing, extra_env, note)."""
+    path = _user_ctx()[0]["PATH"]
+    no_tools = [
+        t for t in ("gst-launch-1.0", "gst-inspect-1.0")
+        if shutil.which(t, path=path) is None
+    ]
+    if no_tools:
+        return no_tools, {}, ""
+
+    missing = await _probe_elements()
+    if not missing:
+        return [], {}, ""  # the system has everything: the bundle stays unused
+
+    key = await _bundle_key()
+    bundle = os.path.join(decky.DECKY_PLUGIN_DIR, "gst-plugins", key) if key else None
+    if not bundle or not os.path.isdir(bundle):
+        note = f"No bundled encoder plugins for this system ({key or 'unknown GStreamer/ffmpeg version'})."
+        decky.logger.warning(note)
+        return missing, {}, note
+
+    os.makedirs(decky.DECKY_PLUGIN_RUNTIME_DIR, exist_ok=True)
+    extra_env = {
+        "GST_PLUGIN_PATH": bundle,
+        # Separate registry so the bundle never touches the user's normal GStreamer cache
+        "GST_REGISTRY_1_0": os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, f"gst-registry-{key}.bin"),
+    }
+    still_missing = await _probe_elements(extra_env)
+    if still_missing:
+        decky.logger.warning(f"Bundle {key} loaded but still missing: {still_missing}")
+        return still_missing, {}, f"Bundled plugins ({key}) did not provide everything."
+
+    decky.logger.info(f"Using bundled GStreamer plugins: {key}")
+    return [], extra_env, ""
 
 # Get the PID of the actual GSR process rather than the flatpak command that spanwed it
 async def _gsr_alive() -> bool:
@@ -201,6 +294,12 @@ class Plugin:
         if not installed:
             decky.logger.info(f"flatpak info said: {stderr.decode().strip()}")
         return installed
+
+    async def check_gstreamer(self) -> dict:
+        missing, _, note = await _resolve_gst()
+        if missing:
+            decky.logger.warning(f"Missing GStreamer components: {missing}")
+        return {"ok": not missing, "missing": missing, "note": note}
 
     async def get_capture_mode(self) -> dict:
         ext = find_external_display()
@@ -263,7 +362,18 @@ class Plugin:
             decky.logger.exception("Failed to build stream command")
             return {"ok": False, "error": f"Internal error building command: {e}"}
 
+        gst_env = {}
+        if not use_gsr:
+            missing, gst_env, note = await _resolve_gst()
+            if missing:
+                msg = "Missing GStreamer components: " + ", ".join(missing)
+                if note:
+                    msg += ". " + note
+                return {"ok": False, "error": msg}
+
         env, user_kwargs = _user_ctx()
+        env.update(gst_env)
+
         log_path = os.path.join(decky.DECKY_PLUGIN_LOG_DIR, log_name)
         try:
             with open(log_path, "ab") as log:

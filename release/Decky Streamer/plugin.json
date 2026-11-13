@@ -1,0 +1,11 @@
+{
+  "name": "Decky Streamer",
+  "author": "Felipe Mellado",
+  "flags": ["debug", "_root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["template", "root"],
+    "description": "Decky pluging to allow the Deck to easily stream while in Game Mode.",
+    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/PluginLoader"
+  }
+}

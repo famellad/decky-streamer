@@ -1,6 +1,6 @@
 {
   "name": "decky-streamer",
-  "version": "0.0.1",
+  "version": "0.1.1",
   "description": "Decky pluging to allow the Deck to easily stream while in Game Mode.",
   "type": "module",
   "scripts": {
