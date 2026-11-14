@@ -17,6 +17,7 @@ The bundled elements are tested against Steam OS >TODO I FORGOR TO CHECK THE VER
 
 ## Requirements
 
+- Keep your Deck/Machine updated, this is especially important for Steam OS.
 - [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader)
 - *(Optional, for docked/external display use)* [GPU Screen Recorder](https://flathub.org/en/apps/com.dec05eba.gpu_screen_recorder) from Flathub
 
