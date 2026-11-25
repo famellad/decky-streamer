@@ -1,199 +1,10 @@
 import asyncio
-import os
-import pwd
 import signal
-import glob
-import shutil
-import re
 
 import decky
 from decky_streamer import config
+from decky_streamer import system
 
-GSR_APP_ID = "com.dec05eba.gpu_screen_recorder"
-GSR_PATTERN = "gpu-screen-recorder -w"   # was "... -w screen", and it would have been the end of it and super easy and not a hassle at all, now we have to pass a connector name because the Steam Deck AMD drivers are fucking stupid
-
-GST_AUDIO_SOURCE = "@DEFAULT_MONITOR@"
-
-# Every element the pipeline in _build_gst_cmd uses (queue is core, so it's not listed).
-GST_REQUIRED = (
-    "pipewiresrc", "pulsesrc",
-    "vapostproc", "vah264enc", "h264parse",
-    "audioconvert", "audioresample", "avenc_aac", "aacparse",
-    "flvmux", "rtmp2sink",
-)
-
-# ---------- Command builders ----------
-def _gst_video_encode(bitrate: int, framerate: int) -> list:
-    return [
-        "vapostproc", "!",
-        "vah264enc", f"bitrate={bitrate}", f"key-int-max={framerate}", "!",
-        "h264parse",
-    ]
-
-# GStreamer
-def _build_gst_cmd(url: str, bitrate: int, framerate: int) -> list:
-    return [
-        "gst-launch-1.0", "-e",
-        "flvmux", "name=mux", "streamable=true", "!",
-        "rtmp2sink", f"location={url}",
-        "pipewiresrc", "target-object=gamescope", "do-timestamp=true", f"keepalive-time={round(1000 / framerate)}", "!", "queue", "!", # Keepalive matches frametime
-        *_gst_video_encode(bitrate, framerate), "!", "queue", "!", "mux.",
-        "pulsesrc", f"device={GST_AUDIO_SOURCE}", "!", "queue", "!",
-        "audioconvert", "!", "audioresample", "!",
-        "avenc_aac", "bitrate=128000", "!", "aacparse", "!", "queue", "!", "mux.",
-    ]
-
-# GPU Screen Recorder (Flatpak)
-def _build_gsr_cmd(url: str, bitrate: int, framerate: int, ext: str) -> list:
-    return [
-        "flatpak", "run", "--command=gpu-screen-recorder", GSR_APP_ID,
-        "-w", ext,
-        "-f", str(framerate),
-        "-a", "default_output",
-        "-c", "flv",
-        "-bm", "cbr",
-        "-q", str(bitrate),
-        "-o", url,
-    ]
-# ---------- process helpers ----------
-# Make an environment for the REAL user to run the processes, can't assume the user is "deck" because of Bazzite
-def _user_env() -> dict:
-    """Environment for child processes, as the real (non-root) user."""
-    pw = pwd.getpwnam(decky.DECKY_USER)
-    runtime_dir = f"/run/user/{pw.pw_uid}"
-    return {
-        "PATH": "/usr/local/bin:/usr/bin:/bin",
-        "HOME": pw.pw_dir,
-        "XDG_RUNTIME_DIR": runtime_dir,
-        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime_dir}/bus",
-        "WAYLAND_DISPLAY": "gamescope-0",  # name of the Wayland socket in Game Mode
-    }
-
-# Run an async command as the user, discard stdout and stderr because we're heathens
-async def _exec(*cmd, extra_env=None) -> int:
-    env = _user_env()
-    if extra_env:
-        env.update(extra_env)
-    p = await asyncio.create_subprocess_exec(
-        *cmd,
-        env=env,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    await p.wait()
-    return p.returncode
-
-
-async def _capture(*cmd) -> str:
-    env = _user_env()
-    p = await asyncio.create_subprocess_exec(
-        *cmd,
-        env=env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL
-    )
-    out, _ = await p.communicate()
-    return out.decode(errors="replace")
-
-# Check to see which GStreamer elements the system has, Bazzite has everything necessary, SteamOS is missing a few
-async def _probe_elements(extra_env=None) -> list:
-    """Names from GST_REQUIRED that gst-inspect cannot find."""
-    # First check alone: with a fresh registry it scans every plugin once,
-    # and the parallel checks after it reuse the result.
-    first = await _exec("gst-inspect-1.0", "--exists", GST_REQUIRED[0], extra_env=extra_env)
-    rest = await asyncio.gather(
-        *(_exec("gst-inspect-1.0", "--exists", e, extra_env=extra_env)
-          for e in GST_REQUIRED[1:])
-    )
-    return [e for e, rc in zip(GST_REQUIRED, [first, *rest]) if rc != 0]
-
-# Figure out the exact directory name so we can use ffmpeg
-async def _bundle_key():
-    """Compatibility key like '1.28-ffmpeg62', or None if it can't be worked out."""
-    # What does GStreamer say?
-    out = await _capture("gst-inspect-1.0", "--version")
-    m = re.search(r"GStreamer (\d+\.\d+)", out)
-
-    if not m:
-        return None
-    
-    # Make sure we grab the soname with the highest number to avoid weird versioning issues in freak systems with multiple installs
-    av = None
-    for d in ("/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu"):
-        found = []
-        for p in glob.glob(os.path.join(d, "libavcodec.so.*")):
-            mm = re.search(r"libavcodec\.so\.(\d+)", os.path.basename(p))
-            if mm:
-                found.append(int(mm.group(1)))
-        if found:
-            av = max(found)
-            break
-    
-    # If we couldn't find any, something's wrong
-    if av is None:
-        return None
-    
-    return f"{m.group(1)}-ffmpeg{av}"
-
-async def _resolve_gst():#
-    """Decide how GStreamer can be used. Returns (missing, extra_env, note)."""
-    path = _user_env()["PATH"]
-
-    # Return immediately if GStreamer we can't even probe GStreamer
-    no_tools = [
-        t for t in ("gst-launch-1.0", "gst-inspect-1.0")
-        if shutil.which(t, path=path) is None
-    ]
-    if no_tools:
-        return no_tools, {}, ""
-
-    missing = await _probe_elements()
-    if not missing:
-        return [], {}, ""  # the system has everything: the bundle stays unused and we keep chigging along
-
-    key = await _bundle_key()
-    bundle = os.path.join(decky.DECKY_PLUGIN_DIR, "gst-plugins", key) if key else None
-    if not bundle or not os.path.isdir(bundle):
-        note = f"No bundled encoder plugins for this system ({key or 'unknown GStreamer/ffmpeg version'})."
-        decky.logger.warning(note)
-        return missing, {}, note
-
-    os.makedirs(decky.DECKY_PLUGIN_RUNTIME_DIR, exist_ok=True)
-    extra_env = {
-        "GST_PLUGIN_PATH": bundle,
-        # Separate registry so the bundle never touches the user's normal GStreamer cache
-        "GST_REGISTRY_1_0": os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, f"gst-registry-{key}.bin"),
-    }
-
-    # Check whether we're still missing anything, despite using the bundled plugins
-    still_missing = await _probe_elements(extra_env)
-    if still_missing:
-        decky.logger.warning(f"Bundle {key} loaded but still missing: {still_missing}")
-        return still_missing, {}, f"Bundled plugins ({key}) did not provide everything."
-
-    decky.logger.info(f"Using bundled GStreamer plugins: {key}")
-    return [], extra_env, ""
-
-# Get whether GSR is running
-async def _gsr_alive() -> bool:
-    return await _exec("pgrep", "-f", GSR_PATTERN) == 0
-
-def find_external_display():
-    """Return the name of a connected non-internal connector (e.g. 'DP-1'), or None."""
-    for status_file in sorted(glob.glob("/sys/class/drm/card*-*/status")):
-        connector = os.path.basename(os.path.dirname(status_file))  # card1-DP-1
-        name = connector.split("-", 1)[1]                           # DP-1
-        if name.startswith(("eDP", "LVDS", "DSI")):
-            continue
-        try:
-            with open(status_file) as f:
-                if f.read().strip() == "connected":
-                    return name
-        except OSError:
-            continue
-    return None
-
-# The actual MEAT of the matter
 class Plugin:
     proc = None  # asyncio subprocess of the running stream, if any
     mode = None  # Gotta choose between GSR and GStreamer, so we know what's going on later
@@ -209,7 +20,7 @@ class Plugin:
             "HOME": decky.DECKY_USER_HOME,
         }
 
-        cmd = ["flatpak", "info", GSR_APP_ID]
+        cmd = ["flatpak", "info", system.GSR_APP_ID]
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -231,14 +42,14 @@ class Plugin:
 
     # Check whether GStreamer is a thing, and what elements are missing if any
     async def check_gstreamer(self) -> dict:
-        missing, _, note = await _resolve_gst()
+        missing, _, note = await system.resolve_gst()
         if missing:
             decky.logger.warning(f"Missing GStreamer components: {missing}")
         return {"ok": not missing, "missing": missing, "note": note}
 
     # Determine which capture mode is gonna get chosen, always falls back to GStreamer if the system doesn't meet the special requirements for GSR to work
     async def get_capture_mode(self) -> dict:
-        ext = find_external_display()
+        ext = system.find_external_display()
         gsr_ok = await self.is_gsr_installed()
         mode = "gsr" if (ext and gsr_ok) else "gstreamer"
         return {"mode": mode, "display": ext, "gsr_installed": gsr_ok}
@@ -282,7 +93,7 @@ class Plugin:
         if service not in config.SERVICES:
             return {"ok": False, "error": f"Unknown service: {service}. Select something from the service dropdown."}
         # ... Or we're root, no monkey business I say
-        if os.geteuid() == 0:
+        if system.are_we_root():
             return {"ok": False, "error": "Decky Streamer must not run as root. Remove the \"root\" flag from plugin.json."}
 
 
@@ -296,7 +107,7 @@ class Plugin:
             }
         url = section["ingest"].rstrip("/") + "/" + section["key"]
 
-        ext = find_external_display()
+        ext = system.find_external_display()
         use_gsr = bool(ext) and await self.is_gsr_installed() # Check whether: 1. There's an external display AND 2. GSR is installed, THEN we can stream...
         # TODO Currently Steam OS cannot stream with GSR even with an external display, but I bet the solution is really fucking stupid I just have to look into the logs
 
@@ -306,11 +117,9 @@ class Plugin:
         # Figure out how to stream
         try:
             if use_gsr:
-                cmd = _build_gsr_cmd(url, bitrate, framerate, ext)
-                log_name = "gsr.log"
+                cmd = system.build_gsr_cmd(url, bitrate, framerate, ext)
             else:
-                cmd = _build_gst_cmd(url, bitrate, framerate)
-                log_name = "gst.log"
+                cmd = system.build_gst_cmd(url, bitrate, framerate)
         except Exception as e: # If we reach this exception something really went horribly fucking wrong tbh
             decky.logger.exception("Failed to build stream command")
             return {"ok": False, "error": f"Internal error building command: {e}"}
@@ -318,7 +127,7 @@ class Plugin:
         # If we fall back to GStreamer, we check whether we have all the elements we need
         gst_env = {}
         if not use_gsr:
-            missing, gst_env, note = await _resolve_gst()
+            missing, gst_env, note = await system.resolve_gst()
             if missing:
                 msg = "Missing GStreamer components: " + ", ".join(missing)
                 if note:
@@ -326,14 +135,12 @@ class Plugin:
                 return {"ok": False, "error": msg}
 
         # Get the user context, make it GStreamer friendly
-        env = _user_env()
+        env = system.user_env()
         env.update(gst_env)
-
-        log_path = os.path.join(decky.DECKY_PLUGIN_LOG_DIR, log_name)
 
         # Finally, after we've learned everything we can in this program, launch the stream with the set parameters, in the set mode, for the set system, with the set user
         try:
-            with open(log_path, "wb") as log:
+            with open(system.log_path(self.mode), "wb") as log:
                 self.proc = await asyncio.create_subprocess_exec(
                     *cmd,
                     env=env,
@@ -352,9 +159,10 @@ class Plugin:
         await asyncio.sleep(2)
         if self.proc.returncode is not None:
             code = self.proc.returncode
+            tmp_mode = self.mode
             self.proc = None
             self.mode = None
-            return {"ok": False, "error": f"Stream process exited immediately (code {code}). See {log_name}."}
+            return {"ok": False, "error": f"Stream process exited immediately (code {code}). See the {tmp_mode}.log file in {decky.DECKY_PLUGIN_LOG_DIR}."}
 
         decky.logger.info(f"Stream started ({service}, {self.mode}), pid {self.proc.pid}")
         return {"ok": True, "pid": self.proc.pid}
@@ -380,18 +188,18 @@ class Plugin:
             return {"ok": True}
 
         # GSR path, so stop it
-        await _exec("pkill", "-INT", "-f", GSR_PATTERN)
+        await system.exec_cmd("pkill", "-INT", "-f", system.GSR_PATTERN)
         if proc.returncode is None:
             proc.send_signal(signal.SIGINT)
 
         
         for _ in range(40):
-            if proc.returncode is not None and not await _gsr_alive():
+            if proc.returncode is not None and not await system.gsr_alive():
                 break
             await asyncio.sleep(0.2)
         else: # ... Or kill it if it's being stubborn
             decky.logger.warning("GSR did not exit on SIGINT, using flatpak kill")
-            await _exec("flatpak", "kill", GSR_APP_ID)
+            await system.exec_cmd("flatpak", "kill", system.GSR_APP_ID)
             await asyncio.sleep(1)
             if proc.returncode is None:
                 proc.kill()
@@ -399,7 +207,7 @@ class Plugin:
         # This is the part where we start freaking out
         # TODO maybe tell the user they should restart their deck?
         # TODO actually, what happens with the state if we have a stream running and just... Reboot the Deck?...
-        still_alive = await _gsr_alive()
+        still_alive = await system.gsr_alive()
         self.proc = None
         self.mode = None
         if still_alive:
@@ -413,7 +221,7 @@ class Plugin:
         decky.logger.info("Decky Streamer loaded")
 
         # Make sure the plugin is running as a regular user, we don't want no monkey business here
-        if os.geteuid() == 0:
+        if system.are_we_root:
             return {"ok": False, "error": "Decky Streamer must not run as root. Remove the \"root\" flag from plugin.json."}
 
     async def _unload(self):
