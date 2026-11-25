@@ -15,7 +15,7 @@ type StatusResult = { running: boolean; pid: number | null };
 
 const isGsrInstalled = callable<[], boolean>("is_gsr_installed");
 const checkGstreamer = callable<[], { ok: boolean; missing: string[]; note?: string }>("check_gstreamer");
-const getCaptureMode = callable<[], { mode: string; display: string | null }>("get_capture_mode");
+const getCaptureMode = callable<[], { mode: string; display: string | null; gsr_installed: boolean }>("get_capture_mode");
 const streamStatus = callable<[], StatusResult>("stream_status");
 const startStream = callable<[service: string], StartResult>("start_stream");
 const stopStream = callable<[], { ok: boolean; error?: string }>("stop_stream");
@@ -46,7 +46,7 @@ function Content() {
   const [installed, setInstalled] = useState<boolean | null>(null);
   const [gstMissing, setGstMissing] = useState<string[]>([]);
   const [gstNote, setGstNote] = useState("");
-  const [captureMode, setCaptureMode] = useState<string>("gsr");
+  const [captureMode, setCaptureMode] = useState<string | null>(null); // This is set to null while we run diagnostics
   const [service, setService] = useState("twitch");
   const [quality, setQuality] = useState(2);
   const [running, setRunning] = useState(false);
@@ -62,11 +62,24 @@ function Content() {
         setGstMissing(r.missing);
         setGstNote(r.note ?? "");
       })
-      .catch(() => {});    getCaptureMode().then((m) => setCaptureMode(m.mode)).catch(() => {});
+      .catch(() => {});        
+      
+    getCaptureMode()
+      .then((m) => {
+        setCaptureMode(m.mode);
+        setInstalled(m.gsr_installed);
+      })
+      .catch(() => setInstalled(false));
+
+    checkGstreamer()
+      .then((r) => {
+        setGstMissing(r.missing);
+        setGstNote(r.note ?? "");
+      })
+      .catch(() => {});
 
     getSelectedService()
       .then((s) => {
-        console.log("[Decky Streamer] loaded:", s);
         setService(s);
       })
       .catch((e) => console.error("[Decky Streamer] load failed:", e));
@@ -107,7 +120,6 @@ function Content() {
   }, [busy, running]);
 
   const onServiceChange = (opt: any) => {
-    console.log("[Decky Streamer] dropdown onChange:", opt);
     const value = typeof opt === "string" ? opt : opt?.data;
     if (typeof value === "string") {
       setService(value);
@@ -151,6 +163,8 @@ function Content() {
       } else {
         setError(r.error ?? "Could not stop stream");
       }
+    } catch (e) {
+      setError(String(e));
     } finally {
       setBusy(false);
     }
@@ -160,7 +174,9 @@ function Content() {
   const gstBroken = captureMode === "gstreamer" && gstMissing.length > 0;
 
   const modeMessage =
-    captureMode === "gsr"
+    captureMode === null 
+      ? "Detecting capture mode..."
+      : captureMode === "gsr"
       ? "External display detected: using GPU Screen Recorder."
       : installed === false
       ? "GPU Screen Recorder not installed: using the PipeWire fallback, performance and quality may be minimally reduced. For an external display, install it from flathub.org in desktop mode."
@@ -200,6 +216,11 @@ function Content() {
         <ButtonItem layout="below" disabled={!running || busy} onClick={onStop}>
           Stop stream
         </ButtonItem>
+      {error && (
+        <PanelSectionRow>
+          <div>{error}</div>
+        </PanelSectionRow>
+      )}
       </PanelSectionRow>
       {gstBroken && (
         <PanelSectionRow>
@@ -215,11 +236,6 @@ function Content() {
       <PanelSectionRow>
         <div>{modeMessage}</div>
       </PanelSectionRow>
-      {error && (
-        <PanelSectionRow>
-          <div>{error}</div>
-        </PanelSectionRow>
-      )}
     </PanelSection>
   );
 }

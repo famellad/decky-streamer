@@ -29,8 +29,8 @@ pnpm run build
 
 rm -rf release && mkdir -p "release/$NAME"
 cp -r dist main.py plugin.json package.json README.md LICENSE \
-      THIRD_PARTY_NOTICES.md licenses gst-plugins "release/$NAME/"
+      THIRD_PARTY_NOTICES.md licenses gst-plugins py_modules "release/$NAME/"
 [ -d defaults ] && cp -r defaults "release/$NAME/"
 
-(cd release && zip -r "$ZIP" "$NAME")
+(cd release && zip -r "$ZIP" "$NAME" -x "*/__pycache__/*")
 echo "Built release/$ZIP"

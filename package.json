@@ -1,6 +1,6 @@
 {
   "name": "decky-streamer",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Decky pluging to allow the Deck to easily stream while in Game Mode.",
   "type": "module",
   "scripts": {
@@ -17,7 +17,10 @@
     "plugin",
     "plugin-template",
     "steam-deck",
-    "deck"
+    "deck",
+    "streaming",
+    "youtube",
+    "twitch"
   ],
   "author": "Felipe Mellado <f.melladou@proton.me>",
   "license": "BSD-3-Clause",

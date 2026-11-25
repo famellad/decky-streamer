@@ -13,17 +13,18 @@ The plugin captures the screen and encodes in hardware, using one of two engines
 
 If your system (Steam OS) is missing any of the required GStreamer elements, the plugin falls back to bundled copies of `gst-plugin-va` and `gst-libav` (keyed to your GStreamer/FFmpeg version), loaded with an isolated plugin registry so they don't touch the rest of your system. Bazzite has all of the components GStreamer needs to stream, so it should work at all times on Bazzite.
 
-The bundled elements are tested against Steam OS >TODO I FORGOR TO CHECK THE VERSION<
+The bundled elements are tested against Steam OS >TODO I FORGOR TO CHECK THE VERSION< and ffmpeg 8.1.2 and GStreamer 1.28.5
 
 ## Requirements
 
+- A Game Mode session that sets the Wayland socket in gamescope-0 (If you're using Steam OS or Bazzite this is already the case)
 - [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader)
-- *(Optional, for docked/external display use)* [GPU Screen Recorder](https://flathub.org/en/apps/com.dec05eba.gpu_screen_recorder) from Flathub
+- *(Optional, for docked/external display use, Bazzite only for now)* [GPU Screen Recorder](https://flathub.org/en/apps/com.dec05eba.gpu_screen_recorder) from Flathub
 
 ## Installation
 
-1. Enable **Dev mode** in Decky Loader (Plugin Manager).
-2. Hit **Install from GitHub** and paste:
+1. Enable **Dev mode** in Decky Loader.
+2. Hit **Install from URL** and paste:
    `https://github.com/famellad/decky-streamer/releases/download/0.1.1/decky-streamer-v0.1.1.zip`
 
 *(Or build a release zip yourself — see [Building](#building) — and install it with Decky's usual zip installer.)*
@@ -60,10 +61,11 @@ The plugin detects it automatically and prefers it whenever an external display 
 
 ## Usage
 
+0. The device MUST BE in Game Mode
 1. Open the **Decky Loader** side panel.
 2. Navigate to **Decky Streamer** and open it.
 3. Pick a service and a quality.
-4. Hit **Start stream** — the status line confirms you're streaming (with the encoder process PID should your nerd ass ever need it).
+4. Hit **Start stream** — the status line confirms you're streaming (with the flatpak process wrapper's PID should your nerd ass ever need it).
 5. **Stop stream** when you're done.
 
 Quality presets (video bitrate):
