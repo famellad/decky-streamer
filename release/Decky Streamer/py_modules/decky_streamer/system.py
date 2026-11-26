@@ -17,8 +17,13 @@ import decky
 #                  *                         
 # -----------------------------------------
 
+LOG_NAMES = {"gsr": "gsr.log", "gstreamer": "gst.log"}
+
+def log_name(mode: str) -> str:
+    return LOG_NAMES[mode]
+
 def log_path(mode: str) -> str:
-    return os.path.join(decky.DECKY_PLUGIN_LOG_DIR, mode)
+    return os.path.join(decky.DECKY_PLUGIN_LOG_DIR, LOG_NAMES[mode])
 
 # Check whether we are running as root
 # This small function is here because I refuse to import os in main.py just for two calls
@@ -40,7 +45,7 @@ def user_env() -> dict: # was _user_env
     }
 
 # Run an async command as the user, discard stdout and stderr because we're heathens
-async def exec_cmd(*cmd, extra_env=None) -> int: # was _exec
+async def exec_cmd(*cmd, extra_env=None) -> int:
     env = user_env()
     if extra_env:
         env.update(extra_env)
@@ -187,7 +192,7 @@ async def _bundle_key():
     
     return f"{m.group(1)}-ffmpeg{av}"
 
-async def _resolve_gst():#
+async def resolve_gst():
     """Decide how GStreamer can be used. Returns (missing, extra_env, note)."""
     path = user_env()["PATH"]
 

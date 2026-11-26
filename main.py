@@ -76,13 +76,22 @@ class Plugin:
         return {"running": running, "pid": self.proc.pid if running else None}
 
     # Async lock wrappers
+    # Now fully try-excepted for extra logging goodness
     async def start_stream(self, service: str) -> dict:
         async with self.lock:
-            return await self._start_stream(service)
+            try:
+                return await self._start_stream(service)
+            except Exception as e:
+                decky.logger.exception("start_stream crashed")
+                return {"ok": False, "error": f"Internal error: {e}"}
 
     async def stop_stream(self) -> dict:
         async with self.lock:
-            return await self._stop_stream()
+            try:
+                return await self._stop_stream()
+            except Exception as e:
+                decky.logger.exception("stop_stream crashed")
+                return {"ok": False, "error": f"Internal error: {e}"}
 
     # JUST GO FOR IT MAN START THE DAMN STREAM ALREADY
     async def _start_stream(self, service: str) -> dict:
@@ -96,7 +105,6 @@ class Plugin:
         if system.are_we_root():
             return {"ok": False, "error": "Decky Streamer must not run as root. Remove the \"root\" flag from plugin.json."}
 
-
         # Figure out where to stream
         section = config.load_config()[service]
         if not section["ingest"] or not section["key"]:
@@ -107,9 +115,12 @@ class Plugin:
             }
         url = section["ingest"].rstrip("/") + "/" + section["key"]
 
+
         ext = system.find_external_display()
         use_gsr = bool(ext) and await self.is_gsr_installed() # Check whether: 1. There's an external display AND 2. GSR is installed, THEN we can stream...
+        mode = "gsr" if use_gsr else "gstreamer"
         # TODO Currently Steam OS cannot stream with GSR even with an external display, but I bet the solution is really fucking stupid I just have to look into the logs
+
 
         bitrate = config.get_bitrate()
         framerate = config.DEFAULT_FRAMERATE
@@ -140,7 +151,7 @@ class Plugin:
 
         # Finally, after we've learned everything we can in this program, launch the stream with the set parameters, in the set mode, for the set system, with the set user
         try:
-            with open(system.log_path(self.mode), "wb") as log:
+            with open(system.log_path(mode), "wb") as log:
                 self.proc = await asyncio.create_subprocess_exec(
                     *cmd,
                     env=env,
@@ -153,16 +164,14 @@ class Plugin:
             decky.logger.error(f"Failed to launch stream: {e}")
             return {"ok": False, "error": f"Failed to launch: {e}"}
 
-        self.mode = "gsr" if use_gsr else "gstreamer"
-
         # Catch immediate failures (bad args, missing plugin, etc.)
         await asyncio.sleep(2)
         if self.proc.returncode is not None:
             code = self.proc.returncode
-            tmp_mode = self.mode
+            self.mode = mode
             self.proc = None
             self.mode = None
-            return {"ok": False, "error": f"Stream process exited immediately (code {code}). See the {tmp_mode}.log file in {decky.DECKY_PLUGIN_LOG_DIR}."}
+            return {"ok": False, "error": f"Stream process exited immediately (code {code}). See {system.log_name(mode)} in {decky.DECKY_PLUGIN_LOG_DIR}."}
 
         decky.logger.info(f"Stream started ({service}, {self.mode}), pid {self.proc.pid}")
         return {"ok": True, "pid": self.proc.pid}
@@ -221,7 +230,7 @@ class Plugin:
         decky.logger.info("Decky Streamer loaded")
 
         # Make sure the plugin is running as a regular user, we don't want no monkey business here
-        if system.are_we_root:
+        if system.are_we_root():
             return {"ok": False, "error": "Decky Streamer must not run as root. Remove the \"root\" flag from plugin.json."}
 
     async def _unload(self):
